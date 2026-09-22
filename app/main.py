@@ -15,6 +15,7 @@ from typing import Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 
 from . import database
+from .compare import compare_messages
 from .delivery import extract_delivery_reports
 from .displaybody import select_display_body
 from .errors import MIMEParseError
@@ -25,6 +26,12 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    CompareDiff,
+    CompareFacetChange,
+    CompareRef,
+    CompareRequest,
+    CompareResponse,
+    CompareSummary,
     DeliveryRecipient,
     DeliveryReport,
     DeliveryReportListResponse,
@@ -101,8 +108,12 @@ app = FastAPI(
         "multipart/report; report-type=delivery-status 作用域并按 "
         "RFC 3464 解析其直接 message/delivery-status 子件（兼容"
         "CRLF/LF 与折叠行，逐收件人校验 Final-Recipient/Action/Status）。"
+        "POST /messages/compare 只读比较两封已归档邮件：按 MIME 文档序"
+        "递归对齐节点，同层按内容指纹配对（重排可识别、重复指纹无法"
+        "唯一配对时标记歧义），给出规范化 Content-Type、头字段与解码"
+        "叶子摘要的新增/删除/变更差异及双方路径，不修改数据库。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -237,6 +248,80 @@ def get_message(
         content_type=row["content_type"],
         size_bytes=row["size_bytes"],
         created_at=row["created_at"],
+    )
+
+
+@app.post("/messages/compare", response_model=CompareResponse)
+def compare_two_messages(
+    payload: CompareRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> CompareResponse:
+    """只读比较两封已归档邮件的 MIME 树（不修改任何记录）。
+
+    按 MIME 文档序递归对齐节点。**节点身份不是物化路径**：每层先按
+    *同层内容指纹*配对（内容指纹与归档指纹同口径——规范化
+    Content-Type、规范化头字段、解码叶子摘要，剔除 boundary /
+    charset / CTE 等打包噪音）：
+
+    * 某指纹在双方各出现一次 → 跨位置唯一配对（识别兄弟重排），随后
+      递归比较该对子树；
+    * 同层该指纹在任一方出现多次（如两个内容完全相同的附件互换）→
+      无法唯一配对，整组记 ``ambiguous``，列出双方全部候选路径；
+    * 唯一配对消费后的剩余节点按文档序 1..n 位置对齐：同位置递归
+      配对（差异落到 ``changed`` 的各 facet 上），数量多出的一侧依次
+      记 ``added`` / ``removed``（只报子树根，附子树节点数）。
+
+    配对节点逐面比较：``content_type``（参数排序、剔除 boundary 与
+    charset）、``disposition``（RFC 2231 参数解码排序）、``headers``
+    （小写名 + 线性空白压缩，不含三个结构头与 CTE）与 ``leaf``
+    （文本叶子规范化文本 SHA-256、非文本叶子解码字节 SHA-256 与长度；
+    容器为 null）。``diffs`` 按双方文档序稳定排序，重复请求结果稳定。
+
+    两个 id 相同返回 **400**；任一 id 不存在返回 **404**；请求体
+    不合规（缺字段、id 非正整数）返回 **422**。
+    """
+
+    if payload.a == payload.b:
+        raise HTTPException(
+            status_code=400,
+            detail=f"a 与 b 必须是不同的邮件 id（两者均为 {payload.a}）",
+        )
+    msg_a = database.get_message(conn, payload.a)
+    if msg_a is None:
+        raise _message_404(payload.a)
+    msg_b = database.get_message(conn, payload.b)
+    if msg_b is None:
+        raise _message_404(payload.b)
+
+    rows_a = database.list_nodes(conn, payload.a)
+    rows_b = database.list_nodes(conn, payload.b)
+    diffs = compare_messages(rows_a, rows_b)
+    counts = {"added": 0, "removed": 0, "changed": 0, "ambiguous": 0}
+    items: list[CompareDiff] = []
+    for d in diffs:
+        counts[d.kind] += 1
+        items.append(
+            CompareDiff(
+                kind=d.kind,
+                a_path=d.a_path,
+                b_path=d.b_path,
+                a_paths=d.a_paths,
+                b_paths=d.b_paths,
+                facets=[
+                    CompareFacetChange(facet=f["facet"], a=f["a"], b=f["b"])
+                    for f in d.facets
+                ],
+                node_count=d.node_count,
+                fingerprint=d.fingerprint,
+                content_type=d.content_type,
+            )
+        )
+    return CompareResponse(
+        a=CompareRef(id=msg_a["id"], fingerprint=msg_a["fingerprint"]),
+        b=CompareRef(id=msg_b["id"], fingerprint=msg_b["fingerprint"]),
+        identical=len(diffs) == 0,
+        summary=CompareSummary(**counts),
+        diffs=items,
     )
 
 

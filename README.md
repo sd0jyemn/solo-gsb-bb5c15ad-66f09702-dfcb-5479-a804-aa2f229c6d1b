@@ -31,12 +31,13 @@ app/
   security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
   delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
+  compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
-  schemas.py     响应模型
-tests/           265 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+  schemas.py     请求/响应模型
+tests/           299 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  cid 引用审计、展示正文选择、安全策略评估、DSN 投递状态、
-                 会话关联、HTTP 端到端）
+                 会话关联、MIME 树比较、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -109,6 +110,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/security-report` | 只读附件安全策略评估（见下，阈值可查询参数覆盖） |
 | GET | `/messages/{id}/delivery-report` | 解析 RFC 3464 投递状态报告（DSN，见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
+| POST | `/messages/compare` | 只读比较两封已归档邮件的 MIME 树（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
@@ -555,6 +557,134 @@ curl http://localhost:8000/messages/2/thread
 `null`）、原始与规范化主题、解析后的 `date`（非法/缺失时 `null`）、
 `parent_id` 与回复深度 `depth`（根为 0）；`edges` 是父子边
 （`parent_id` 是 `child_id` 的直接父件）。邮件不存在返回 **404**。
+
+## 两封邮件 MIME 树比较
+
+```bash
+curl -X POST http://localhost:8000/messages/compare \
+     -H 'Content-Type: application/json' \
+     -d '{"a": 1, "b": 2}'
+```
+
+在**两封已归档邮件**的 MIME 树上做只读、确定性的递归比较。该接口是
+**纯只读查询**：只读取归档时保存的节点行，不写入、不修改任何记录，
+对历史归档数据同样有效；同一对邮件重复请求结果逐字节稳定。
+
+### 对齐与配对
+
+按 **MIME 文档序**（先根后子、兄弟按 1..n）递归对齐节点。**物化路径
+不是节点身份**——兄弟节点重排时路径会整体改变。每一层先按
+**同层内容指纹**配对，内容指纹与归档指纹同口径（规范化 Content-Type、
+规范化头字段、解码叶子摘要，剔除 multipart `boundary`、文本
+`charset`、CTE 等打包噪音，取规范 JSON 的 SHA-256）：
+
+- 某指纹在双方各出现一次 → **跨位置唯一配对**（因此纯重排被判等价，
+  重排后的变更也能落到正确的对应节点上），随后递归比较该对子树；
+- 同层该指纹在任一方出现多次（如两个内容完全相同的附件互换、一侧
+  多了一份副本）→ 无法唯一配对，整组记 **`ambiguous`**，列出双方
+  全部候选路径（`a_paths` / `b_paths`），不强行按位置落对、也不把
+  多出的副本简单记成新增；
+- 唯一配对消费后的剩余节点按文档序 1..n **位置对齐**：同位置递归
+  配对（内容差异落到 `changed` 的各 facet 上），数量多出的一侧依次
+  记 **`added`** / **`removed`**——只报子树根并附 `node_count`
+  （该子树的节点总数），不展开每个节点；
+- 容器 ↔ 叶子这类跨结构配对：节点本身记 `changed`（`content_type`
+  等 facet），容器一侧的子节点在该层对齐中全部成为 `removed` /
+  `added`。
+
+### 比较侧面（facet）
+
+每对配对节点逐面比较四个规范化侧面，`changed` 项的 `facets` 只列出
+**有差异**的侧面（顺序固定：`content_type` → `disposition` →
+`headers` → `leaf`）：
+
+| facet | 规范化口径 |
+| ---- | ---- |
+| `content_type` | `{media_type, params}`：媒体类型小写，参数 RFC 2231 解码后排序；剔除 `boundary`（打包噪音）与 `charset`（内容已解码） |
+| `disposition` | `{type, params}` 或 `null`：disposition 小写、参数解码排序 |
+| `headers` | `[[小写名, 线性空白压缩后的解码值], ...]`，保留重复头与顺序；不含三个结构头（Content-Type / Content-Disposition / Content-Transfer-Encoding），故 CTE 不参与比较 |
+| `leaf` | 文本叶子 `{kind:"text", text_sha256, length}`（规范化文本的 SHA-256 与字符数）；非文本叶子 `{kind:"blob", blob_sha256, length}`（解码字节的 SHA-256）；容器为 `null` |
+
+### 响应
+
+`diffs` 按双方文档序稳定排序（同层 `changed` → `ambiguous` →
+`removed` → `added`）；`summary` 给出各类条数统计。示例（两封
+mixed 邮件，第二叶子文本由 `two` 变为 `TWO!`，且一侧多了附件）：
+
+```json
+{
+  "a": {"id": 1, "fingerprint": "8fbf98a6…2bd"},
+  "b": {"id": 2, "fingerprint": "0cda5052…efe"},
+  "identical": false,
+  "summary": {"added": 1, "removed": 0, "changed": 1, "ambiguous": 0},
+  "diffs": [
+    {
+      "kind": "changed",
+      "a_path": "2",
+      "b_path": "2",
+      "a_paths": ["2"],
+      "b_paths": ["2"],
+      "facets": [
+        {
+          "facet": "leaf",
+          "a": {"kind": "text", "text_sha256": "7692c3ad…", "length": 3},
+          "b": {"kind": "text", "text_sha256": "24f1afcf…", "length": 4}
+        }
+      ],
+      "node_count": null,
+      "fingerprint": null,
+      "content_type": "text/plain"
+    },
+    {
+      "kind": "added",
+      "a_path": null,
+      "b_path": "3",
+      "a_paths": [],
+      "b_paths": ["3"],
+      "facets": [],
+      "node_count": 1,
+      "fingerprint": null,
+      "content_type": "application/pdf"
+    }
+  ]
+}
+```
+
+`ambiguous` 项示例（双方各有两份相同叶子，无法区分谁对应谁）：
+
+```json
+{
+  "kind": "ambiguous",
+  "a_path": null,
+  "b_path": null,
+  "a_paths": ["1", "2"],
+  "b_paths": ["2", "3"],
+  "facets": [],
+  "node_count": null,
+  "fingerprint": "c1e372ae…8001",
+  "content_type": "image/png"
+}
+```
+
+说明：
+
+- `identical: true` 当且仅当递归比较无任何差异。注意归档指纹把
+  **节点顺序**纳入指纹，而比较不以路径为身份——因此仅兄弟顺序不同的
+  两封邮件是不同归档 id，但比较结果 `identical`；规范化后完全等价
+  （boundary / CTE / 头大小写不同）的邮件在归档时已幂等为同一 id；
+- `changed` 项同时给出 `a_path` / `b_path`；`added` 只给
+  `b_path`、`removed` 只给 `a_path`；`ambiguous` 两者均为 `null`，
+  候选在 `a_paths` / `b_paths` 中；
+- 根节点路径为 `""`，单节点邮件的差异 `a_path` / `b_path` 都是
+  `""`。
+
+### 错误
+
+| 状态码 | 条件 |
+| ---- | ---- |
+| **400** | `a` 与 `b` 是同一个 id（自比较无意义） |
+| **404** | 任一 id 在归档中不存在（`detail` 指明具体 id） |
+| **422** | 请求体不合规：缺字段、字段非整数、id 小于 1 |
 
 ## 内容寻址附件库
 

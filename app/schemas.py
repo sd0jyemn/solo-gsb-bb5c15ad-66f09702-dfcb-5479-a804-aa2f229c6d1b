@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MessageSummary(BaseModel):
@@ -290,6 +290,72 @@ class DeliveryReportListResponse(BaseModel):
     id: int
     fingerprint: str
     reports: list[DeliveryReport]
+
+
+# ---------------------------------------------------------------------------
+# 两封邮件 MIME 树比较（POST /messages/compare）
+# ---------------------------------------------------------------------------
+
+
+class CompareRequest(BaseModel):
+    """比较请求：两个已归档邮件 id（必须存在且互不相同）。"""
+
+    a: int = Field(..., ge=1, description="第一封邮件的归档 id")
+    b: int = Field(..., ge=1, description="第二封邮件的归档 id")
+
+
+class CompareRef(BaseModel):
+    """比较侧的邮件标识。"""
+
+    id: int
+    fingerprint: str
+
+
+class CompareFacetChange(BaseModel):
+    """一对配对节点上单个规范化侧面的差异。"""
+
+    facet: str  # content_type | disposition | headers | leaf
+    a: object = None
+    b: object = None
+
+
+class CompareDiff(BaseModel):
+    """一条节点差异。
+
+    * ``changed``：双方各一个节点（``a_path`` / ``b_path``），
+      ``facets`` 给出有差异的侧面；
+    * ``added`` / ``removed``：只在一侧出现的子树根，``node_count``
+      为该子树节点总数；
+    * ``ambiguous``：同层同内容指纹但任一侧出现多次、无法唯一配对，
+      ``a_paths`` / ``b_paths`` 列出双方全部候选路径。
+    """
+
+    kind: str  # added | removed | changed | ambiguous
+    a_path: Optional[str] = None
+    b_path: Optional[str] = None
+    a_paths: list[str] = []
+    b_paths: list[str] = []
+    facets: list[CompareFacetChange] = []
+    node_count: Optional[int] = None  # added / removed 子树的节点总数
+    fingerprint: Optional[str] = None  # ambiguous 组的重复内容指纹
+    content_type: Optional[str] = None
+
+
+class CompareSummary(BaseModel):
+    """各类差异条数统计（ambiguous 按条目数计，不按候选数展开）。"""
+
+    added: int
+    removed: int
+    changed: int
+    ambiguous: int
+
+
+class CompareResponse(BaseModel):
+    a: CompareRef
+    b: CompareRef
+    identical: bool  # 规范化后整封邮件等价时为 true（diffs 为空）
+    summary: CompareSummary
+    diffs: list[CompareDiff]
 
 
 class ErrorBody(BaseModel):
