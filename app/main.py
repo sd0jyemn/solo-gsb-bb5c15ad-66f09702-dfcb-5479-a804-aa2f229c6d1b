@@ -15,6 +15,7 @@ from typing import Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 
 from . import database
+from .compare import compare_trees
 from .delivery import extract_delivery_reports
 from .displaybody import select_display_body
 from .errors import MIMEParseError
@@ -25,6 +26,8 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    CompareRequest,
+    CompareResponse,
     DeliveryRecipient,
     DeliveryReport,
     DeliveryReportListResponse,
@@ -35,8 +38,10 @@ from .schemas import (
     MessageSummary,
     NodeDetail,
     NodeDetailResponse,
+    NodeDifference,
     NodeListResponse,
     NodeSummary,
+    CompareFieldDifference,
     RelatedOrphan,
     RelatedReference,
     RelatedResourcesResponse,
@@ -101,8 +106,12 @@ app = FastAPI(
         "multipart/report; report-type=delivery-status 作用域并按 "
         "RFC 3464 解析其直接 message/delivery-status 子件（兼容"
         "CRLF/LF 与折叠行，逐收件人校验 Final-Recipient/Action/Status）。"
+        "POST /messages/compare 对两封已归档邮件做只读的递归 MIME 树"
+        "对比：按 MIME 文档序对齐节点（同层重排按子树内容指纹配对，"
+        "无法唯一配对则标记歧义），比较规范化 Content-Type、头字段与"
+        "解码叶子摘要，返回稳定的新增/删除/变更节点差异及双方路径。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -237,6 +246,93 @@ def get_message(
         content_type=row["content_type"],
         size_bytes=row["size_bytes"],
         created_at=row["created_at"],
+    )
+
+
+@app.post("/messages/compare", response_model=CompareResponse)
+def compare_messages(
+    payload: CompareRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> CompareResponse:
+    """对比两封已归档邮件的 MIME 树（纯只读，不修改数据库）。
+
+    按 MIME 文档序递归对齐两封邮件的节点，比较三个规范化面：
+
+    * **Content-Type**：重新解析并小写化媒体类型，参数按名排序，
+      剔除 ``boundary`` 与文本节点的 ``charset``（与指纹口径一致）；
+    * **头字段**：头名小写、值压缩线性空白（剔除 Content-Type 与
+      Content-Transfer-Encoding），同名重复头按文档序逐位对齐；
+    * **解码叶子摘要**：文本叶子取规范化文本的长度与 SHA-256，
+      非文本叶子取解码字节的长度与 SHA-256。
+
+    同层子节点**不按路径身份**对齐：先按子树内容指纹配对，内容
+    完全相同的子树即使重排也识别为无差异；同指纹重复在两侧数量
+    不等、无法唯一配对时给出 ``ambiguous`` 节点差异（含双方候选
+    路径）；其余节点按文档序逐位配对，数量不等时多出的整棵子树
+    记为 added / removed。差异按双方文档序稳定排序。
+
+    两个 id 相同返回 **400**；任一 id 不存在返回 **404**。
+    """
+
+    id_a, id_b = payload.message_id_a, payload.message_id_b
+    if id_a == id_b:
+        raise HTTPException(
+            status_code=400,
+            detail="message_id_a 与 message_id_b 必须是两个不同的邮件 id",
+        )
+
+    missing = sorted({mid for mid in (id_a, id_b)
+                      if database.get_message(conn, mid) is None})
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"邮件不存在: {', '.join(str(m) for m in missing)}",
+        )
+
+    msg_a = database.get_message(conn, id_a)
+    msg_b = database.get_message(conn, id_b)
+    assert msg_a is not None and msg_b is not None
+    result = compare_trees(
+        database.list_nodes(conn, id_a),
+        database.list_nodes(conn, id_b),
+    )
+
+    def summary(row: sqlite3.Row) -> MessageSummary:
+        return MessageSummary(
+            id=row["id"],
+            fingerprint=row["fingerprint"],
+            raw_sha256=row["raw_sha256"],
+            content_type=row["content_type"],
+            size_bytes=row["size_bytes"],
+            created_at=row["created_at"],
+        )
+
+    return CompareResponse(
+        a=summary(msg_a),
+        b=summary(msg_b),
+        identical=result.identical,
+        differences=[
+            NodeDifference(
+                change=d.change,
+                path_a=d.path_a,
+                path_b=d.path_b,
+                content_type_a=d.content_type_a,
+                content_type_b=d.content_type_b,
+                fields=[
+                    CompareFieldDifference(
+                        facet=f.facet,
+                        header=f.header,
+                        change=f.change,
+                        before=f.before,
+                        after=f.after,
+                    )
+                    for f in d.fields
+                ],
+                candidates_a=d.candidates_a,
+                candidates_b=d.candidates_b,
+            )
+            for d in result.differences
+        ],
     )
 
 

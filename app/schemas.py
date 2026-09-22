@@ -292,6 +292,49 @@ class DeliveryReportListResponse(BaseModel):
     reports: list[DeliveryReport]
 
 
+# ---------------------------------------------------------------------------
+# 双邮件 MIME 树对比（POST /messages/compare）
+# ---------------------------------------------------------------------------
+
+
+class CompareRequest(BaseModel):
+    """对比请求：两个已归档邮件 id（必须不同）。"""
+
+    message_id_a: int
+    message_id_b: int
+
+
+class CompareFieldDifference(BaseModel):
+    """节点单个比较面的差异（Content-Type / 头字段 / 叶子摘要）。"""
+
+    facet: str  # content_type | header | leaf_digest
+    header: Optional[str] = None  # facet == header 时的小写头名
+    change: Optional[str] = None  # facet == header：added | removed | modified
+    before: object = None
+    after: object = None
+
+
+class NodeDifference(BaseModel):
+    """一条节点级差异：变更 / 新增 / 删除 / 歧义。"""
+
+    change: str  # changed | added | removed | ambiguous
+    path_a: Optional[str] = None
+    path_b: Optional[str] = None
+    content_type_a: Optional[str] = None
+    content_type_b: Optional[str] = None
+    fields: list[CompareFieldDifference] = []
+    # change == ambiguous：同层同内容指纹无法唯一配对的双方候选路径
+    candidates_a: list[str] = []
+    candidates_b: list[str] = []
+
+
+class CompareResponse(BaseModel):
+    a: MessageSummary
+    b: MessageSummary
+    identical: bool
+    differences: list[NodeDifference]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

@@ -31,12 +31,13 @@ app/
   security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
   delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
+  compare.py     双邮件 MIME 树递归对比（文档序/子树指纹对齐、歧义标记，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
-  schemas.py     响应模型
-tests/           265 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+  schemas.py     请求/响应模型
+tests/           299 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  cid 引用审计、展示正文选择、安全策略评估、DSN 投递状态、
-                 会话关联、HTTP 端到端）
+                 会话关联、双邮件树对比、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -109,6 +110,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/security-report` | 只读附件安全策略评估（见下，阈值可查询参数覆盖） |
 | GET | `/messages/{id}/delivery-report` | 解析 RFC 3464 投递状态报告（DSN，见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
+| POST | `/messages/compare` | 只读对比两封已归档邮件的 MIME 树（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
@@ -555,6 +557,120 @@ curl http://localhost:8000/messages/2/thread
 `null`）、原始与规范化主题、解析后的 `date`（非法/缺失时 `null`）、
 `parent_id` 与回复深度 `depth`（根为 0）；`edges` 是父子边
 （`parent_id` 是 `child_id` 的直接父件）。邮件不存在返回 **404**。
+
+## 双邮件 MIME 树对比
+
+```bash
+curl -X POST http://localhost:8000/messages/compare \
+     -H 'Content-Type: application/json' \
+     -d '{"message_id_a": 1, "message_id_b": 2}'
+```
+
+对两封**已归档**邮件做只读、确定性的递归 MIME 树对比。该接口是
+**纯只读查询**：只读取归档时保存的节点行，不改写任何记录，对历史
+归档数据同样有效；同一对邮件重复请求结果稳定。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| `message_id_a` | int | 第一封邮件的归档 id（差异中的 A 侧 / `before`） |
+| `message_id_b` | int | 第二封邮件的归档 id（差异中的 B 侧 / `after`） |
+
+**比较的三个规范化面**（节点配对后逐面比较）：
+
+- **规范化 Content-Type**（`content_type`）：重新解析归档时保存的
+  Content-Type 头，媒体类型小写化，参数按名排序；与指纹口径一致
+  地剔除打包/传输噪音 `boundary` 与文本节点的 `charset`；
+- **头字段**（`header`）：头名小写、值做线性空白压缩（连续 WSP 压成
+  一个空格、去两端），剔除 `Content-Type`（单独比较）与
+  `Content-Transfer-Encoding`（传输噪音，叶子已解码）；同名重复头
+  按文档序逐位对齐，整体头顺序变化不算差异；
+- **解码叶子摘要**（`leaf_digest`）：文本叶子取规范化文本的
+  `{kind: "text", length, sha256}`，非文本叶子取解码字节的
+  `{kind: "blob", length, sha256}`；容器节点无叶子摘要。
+
+**节点对齐规则**（关键：不把物化路径当身份）：
+
+1. 根节点固定配对，递归进入每一对已配对节点的直接子件层；
+2. 同层子节点先按**子树内容指纹**（节点三面 + 文档序子指纹）配对：
+   指纹一一对应即配对——内容完全相同的子树即使发生**重排**也识别
+   为无差异；同指纹重复在两侧等重（n == n）时按文档序逐对配对
+   （内容完全相同，配对无歧义）；
+3. 同指纹重复在两侧都存在但**数量不等**（如 A 侧 1 份、B 侧 2 份），
+   一一对应关系不唯一，给出 `ambiguous` 记录并列出双方全部候选
+   路径；少量侧之外的多余子树**同时**按 `added` / `removed` 呈现，
+   保证差异完整（具体哪一份对应哪一份仍以 `ambiguous` 为准）；
+4. 其余没有指纹对应的节点按 MIME 文档序**逐位配对**（内容变更
+   场景），数量不等时多出的整棵子树按节点记 `added` / `removed`
+   （先根后叶，容器与后代各一条）。
+
+差异整体按双方文档序稳定排序。
+
+响应中 `differences` 每项：
+
+| `change` | 含义 | 路径字段 |
+| ---- | ---- | ---- |
+| `changed` | 双方节点已配对，但至少一个面不同 | `path_a` + `path_b` |
+| `added` | 仅 B 侧存在的节点（整棵新增子树的每个节点各一条） | `path_b` |
+| `removed` | 仅 A 侧存在的节点 | `path_a` |
+| `ambiguous` | 同层同内容指纹重复数量不等、无法唯一配对 | `candidates_a` / `candidates_b` |
+
+`changed` 项的 `fields` 列出具体面差异：
+
+- `{"facet": "content_type", "before": {...}, "after": {...}}`
+- `{"facet": "header", "header": "x-custom", "change": "added"|"removed"|"modified", "before": [...], "after": [...]}`（值按重复头文档序成组）
+- `{"facet": "leaf_digest", "before": {...}, "after": {...}}`
+
+响应示例（B 邮件第一个叶子多了一个头、第二个叶子正文变更）：
+
+```json
+{
+  "a": {"id": 1, "fingerprint": "58d92498…431", "...": "..."},
+  "b": {"id": 3, "fingerprint": "97d9604f…6fb", "...": "..."},
+  "identical": false,
+  "differences": [
+    {
+      "change": "changed",
+      "path_a": "1",
+      "path_b": "1",
+      "content_type_a": "text/plain",
+      "content_type_b": "text/plain",
+      "fields": [
+        {"facet": "header", "header": "x-custom", "change": "added",
+         "before": [], "after": ["foo"]}
+      ],
+      "candidates_a": [],
+      "candidates_b": []
+    },
+    {
+      "change": "changed",
+      "path_a": "2",
+      "path_b": "2",
+      "content_type_a": "text/plain",
+      "content_type_b": "text/plain",
+      "fields": [
+        {"facet": "leaf_digest",
+         "before": {"kind": "text", "length": 5, "sha256": "486e…8a7a"},
+         "after":  {"kind": "text", "length": 6, "sha256": "daa6…4576"}}
+      ],
+      "candidates_a": [],
+      "candidates_b": []
+    }
+  ]
+}
+```
+
+两封邮件各面完全一致时 `"identical": true` 且 `"differences": []`。
+
+异常情况：
+
+- `message_id_a` 与 `message_id_b` 相同：**400**
+  （即使该 id 不存在，也优先判 400）；
+- 任一 id 在归档中不存在：**404**，错误信息列出全部缺失 id；
+- 请求体缺字段或字段类型错误：FastAPI 校验 **422**；
+- 接口不写入任何数据，重复请求不改变 `messages` / `nodes` /
+  `attachments` / `attachment_refs` 表。
 
 ## 内容寻址附件库
 
